@@ -1,0 +1,171 @@
+name: "Deploy API STAGE environment"
+on:
+  push:
+    branches:
+      - dev
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'README.md'
+  pull_request:
+    branches:
+      - dev
+    types:
+      - closed
+
+jobs:
+  build:
+    name: "Build"
+    runs-on: ubuntu-latest
+    outputs:
+      api-image: ${{ steps.build-app-image.outputs.image }}
+      migration-image: ${{ steps.build-migration-image.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: "actions/checkout@v4"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+    
+      - name: Build, tag, and push application image to Amazon ECR
+        id: build-app-image
+        env:
+          API_ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          API_ECR_REPOSITORY: dev-nodejs-app
+          IMAGE_TAG: latest
+        run: |
+          docker build -f api.dockerfile -t $API_ECR_REGISTRY/$API_ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $API_ECR_REGISTRY/$API_ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$API_ECR_REGISTRY/$API_ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push migration image to Amazon ECR
+        id: build-migration-image
+        env:
+          MIGRATION_ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          MIGRATION_ECR_REPOSITORY: dev-migration
+          IMAGE_TAG: latest
+        run: |
+          docker build -f migration.dockerfile -t $MIGRATION_ECR_REGISTRY/$MIGRATION_ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $MIGRATION_ECR_REGISTRY/$MIGRATION_ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$MIGRATION_ECR_REGISTRY/$MIGRATION_ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  migration:
+    name: "Migration"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Adjust permissions and cleaning
+        run: |
+          sudo chown -R ubuntu:ubuntu /opt/actions-runner
+          rm -rf ~/.aws/
+        working-directory: /opt/actions-runner
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: us-east-1
+          role-duration-seconds: 3600
+          role-chaining: true
+
+      - name: Download migration task definition
+        run: aws ecs describe-task-definition --task-definition dev-api-migration --query taskDefinition > task-definition-migration.json
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def-migration
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition-migration.json
+          container-name: dev-api-migration-container
+          image: ${{ needs.build.outputs.migration-image }}
+
+      - name: Deploy Amazon ECS migration task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def-migration.outputs.task-definition }}
+          cluster: dev-cluster
+
+      - name: Run migration task
+        run: |
+          aws ecs run-task --cluster dev-cluster \
+            --launch-type EC2 \
+            --task-definition `aws ecs list-task-definitions --status active --family-prefix dev-api-migration --sort desc --max-items 1 | jq -r '.taskDefinitionArns[0]'`
+
+  deploy:
+    name: "Deployment"
+    if: ${{ github.event.pull_request.merged == true && always() && !failure() && !cancelled() }}
+    runs-on:
+      - self-hosted
+      - krunners
+      - linux
+      - x64
+      - medium
+    needs:
+      - build
+    steps:
+      - name: Adjust permissions and cleaning
+        run: |
+          sudo chown -R ubuntu:ubuntu /opt/actions-runner
+          rm -rf ~/.aws/
+        working-directory: /opt/actions-runner
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: us-east-1
+          role-duration-seconds: 3600
+          role-chaining: true
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Download migration task definition
+        run: aws ecs describe-task-definition --task-definition dev-api-migration --query taskDefinition > task-definition-migration.json
+
+      - name: Fill in the new image ID in the Amazon ECS migration task definition
+        id: task-def-migration
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition-migration.json
+          container-name: dev-api-migration-container
+          image: ${{ needs.build.outputs.migration-image }}
+
+      - name: Deploy Amazon ECS migration task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def-migration.outputs.task-definition }}
+          cluster: dev-cluster
+
+      - name: Run migration task
+        run: |
+          aws ecs run-task --cluster dev-cluster \
+            --launch-type EC2 \
+            --task-definition `aws ecs list-task-definitions --status active --family-prefix dev-api-migration --sort desc --max-items 1 | jq -r '.taskDefinitionArns[0]'`
+
+      - name: Download API task definition
+        run: aws ecs describe-task-definition --task-definition dev-api --query taskDefinition > task-definition-api.json
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition-api.json
+          container-name: dev-api-container
+          image: ${{ needs.build.outputs.api-image }}
+
+      - name: Deploy Amazon ECS API task definition to public service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: nodejs-app-service
+          cluster: dev-cluster
+          wait-for-service-stability: true
